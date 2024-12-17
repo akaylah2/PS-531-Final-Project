@@ -1,0 +1,282 @@
+---
+title: "PS 531_PAP Code"
+author: "Akayla A. Henson"
+date: "13 December 2024"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r Load Data and Libraries}
+#load the data
+options(timeout = 180)
+url <- "https://raw.githubusercontent.com/akaylah2/PS-531-Final-Project/refs/heads/main/LMPD.stops_Jun2014-Dec2020.rds"
+LMPD.stops <- readRDS(url(url)) 
+
+#install needed packages
+#install.packages("DeclareDesign")
+#install.packages("DesignLibrary")
+
+#load necessary libraries 
+library(dplyr)
+library(DeclareDesign)
+library(DesignLibrary)
+library(gt)
+library(ggplot2)
+
+```
+
+
+```{r Creating Adverse Outcome Variable}
+#creating adverse outcome variable 
+LMPD.stops <- LMPD.stops %>%
+  mutate(
+    adverse_outcome = if_else(
+      frisk_performed == TRUE | search_conducted == TRUE | citation_issued == TRUE,
+      1,  # Assign 1 if any condition is true
+      0   # Assign 0 otherwise
+    )
+  )
+
+#check the data
+table(LMPD.stops$adverse_outcome)  # Frequency of adverse outcomes
+
+# Save the dataset as an RDS file
+#saveRDS(data, "LMPD_stops.rds")
+
+# Reload the dataset later
+#LMPD.stops1 <- readRDS("LMPD_stops.rds")
+
+```
+
+
+```{r Declare Design}
+#declare the data
+population <- declare_population(
+  N = 20000,
+  race = sample(c("black", "white", "hispanic", "asian/pacific islander"), N, replace = TRUE, prob = c(0.4, 0.3, 0.2, 0.1)),  # Fix probabilities
+  lat = rnorm(N),  # Example covariate
+  lng = rnorm(N),  # Example covariate
+  white_vs_nonwhite = ifelse(race == "white", 1, 0),  # Binary treatment variable
+  propensity_score = plogis(-1 + 0.5 * (race == "black") + 0.3 * lat),  # Valid logistic model
+  adverse_outcome = rbinom(N, 1, propensity_score)  # Outcome
+)
+
+#declare the sampling procedure
+sampling <- declare_sampling(S = complete_rs(N = 20000, n = 10000))  # Simple random sampling
+
+#declare the matching strategy
+matching <- declare_step(
+  handler = function(data) {
+    library(MatchIt)  # Ensure MatchIt is loaded
+    # Perform matching using the binary treatment variable
+    match_model <- matchit(white_vs_nonwhite ~ lat + lng, data = data, method = "nearest")
+    # Extract the matched data
+    matched_data <- match.data(match_model)
+    return(matched_data)
+  }
+)
+
+#declare the inquiry
+inquiry <- declare_inquiry(
+  ATE = mean(adverse_outcome[white_vs_nonwhite == 1]) - 
+        mean(adverse_outcome[white_vs_nonwhite == 0])
+)
+
+#declare the estimator
+estimator <- declare_estimator(
+  adverse_outcome ~ white_vs_nonwhite, 
+  model = lm_robust, 
+  inquiry = "ATE"
+)
+
+#combine into a design
+design <- population + sampling + matching + inquiry + estimator
+
+#diagnose the design
+diagnosis <- diagnose_design(design)
+summary(diagnosis)
+
+```
+
+
+```{r Visualizing the Performance of the Design}
+#extract diagnostics into a data frame
+diagnostics <- as.data.frame(diagnosis$diagnosands_df)
+print(diagnostics)
+
+#create a table
+styled_table <- gt(diagnostics) %>%
+  tab_header(
+    title = "Design Diagnostics Summary",
+    subtitle = "Performance metrics of the propensity score matching design"
+  ) %>%
+  cols_label(
+    term = "Term",
+    mean_estimand = "Mean Estimand",
+    mean_estimate = "Mean Estimate",
+    bias = "Bias",
+    sd_estimate = "SD Estimate",
+    power = "Power",
+    coverage = "Coverage"
+  ) %>%
+  fmt_number(
+    columns = c(mean_estimand, mean_estimate, bias, sd_estimate, power, coverage),
+    decimals = 3
+  ) %>%
+   tab_options(
+    table.font.size = "small",
+    data_row.padding = px(5)
+  )
+
+gtsave(styled_table, "diagnostics_summary.html")
+browseURL("diagnostics_summary.html")
+
+#plot bias and variability
+ggplot(diagnostics, aes(x = term, y = bias, fill = outcome)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_errorbar(aes(ymin = bias - sd_estimate, ymax = bias + sd_estimate),
+                width = 0.2, position = position_dodge(0.9)) +
+  labs(
+    title = "Bias and Variability Across Simulations",
+    x = "Term",
+    y = "Bias"
+  ) +
+  theme_minimal()
+
+#combine power and coverage in a single plot
+ggplot(diagnostics, aes(x = term, fill = outcome)) +
+  geom_bar(aes(y = power), stat = "identity", position = "dodge", alpha = 0.7) +
+  geom_point(aes(y = coverage), position = position_dodge(width = 0.9), size = 3, color = "blue") +
+  labs(
+    title = "Power and Coverage Across Simulations",
+    x = "Term",
+    y = "Value"
+  ) +
+  scale_y_continuous(sec.axis = sec_axis(~., name = "Coverage")) +
+  theme_minimal()
+
+
+#faceted plot for diagnostics
+if ("outcome" %in% colnames(diagnostics)) {
+  ggplot(diagnostics, aes(x = term, y = mean_estimate, fill = outcome)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    facet_wrap(~ outcome, scales = "free_y", labeller = label_both) +
+    labs(
+      title = "Design Diagnostics Across Outcomes",
+      x = "Term",
+      y = "Mean Estimate"
+    ) +
+    theme_minimal()
+} else {
+  print("Column 'outcome' does not exist. Update the facet variable.")
+}
+
+#save the table as a CSV
+write.csv(diagnostics, "diagnostics_summary.csv", row.names = FALSE)
+
+#save the plot
+ggsave("bias_plot.png", width = 8, height = 6)
+ggsave("power_plot.png", width = 8, height = 6)
+
+```
+
+
+```{r Sensitivity Analyses}
+#sensitivity analysis: Introduce missing data
+population_with_missing <- declare_population(
+  N = 20000,
+  race = sample(c("black", "white", "hispanic", "asian/pacific islander"), N, replace = TRUE, prob = c(0.4, 0.3, 0.2, 0.1)),
+  lat = rnorm(N),
+  lng = rnorm(N),
+  white_vs_nonwhite = ifelse(race == "white", 1, 0),
+  propensity_score = plogis(-1 + 0.5 * (race == "black") + 0.3 * lat),
+  adverse_outcome = ifelse(runif(N) < 0.1, NA, rbinom(N, 1, propensity_score))  # 10% missing outcome
+)
+
+#declare the design with missing data
+design_with_missing <- population_with_missing + sampling + inquiry + estimator
+
+#Diagnose the design
+diagnosis_with_missing <- diagnose_design(design_with_missing)
+summary(diagnosis_with_missing)
+
+
+#sensitivity analysis: Introduce outliers
+population_with_outliers <- declare_population(
+  N = 20000,
+  race = sample(c("black", "white", "hispanic", "asian/pacific islander"), N, replace = TRUE, prob = c(0.4, 0.3, 0.2, 0.1)),
+  lat = c(rnorm(N - 10), rep(10, 10)),  # Introduce 10 extreme values in lat
+  lng = rnorm(N),
+  white_vs_nonwhite = ifelse(race == "white", 1, 0),
+  propensity_score = plogis(-1 + 0.5 * (race == "black") + 0.3 * lat),
+  adverse_outcome = rbinom(N, 1, propensity_score)  # Outcome without missingness
+)
+
+#declare the design with outliers
+design_with_outliers <- population_with_outliers + sampling + inquiry + estimator
+
+#diagnose the design
+diagnosis_with_outliers <- diagnose_design(design_with_outliers)
+summary(diagnosis_with_outliers)
+
+
+```
+
+
+```{r Tables/Figures}
+
+#summary by race with unknown and NA filtered out
+race_summary <- LMPD.stops %>%
+  filter(!is.na(subject_race) & subject_race != "unknown") %>%  # Exclude NA and "unknown"
+  group_by(subject_race) %>%
+  summarize(
+    total_stops = n(),
+    adverse_outcome_count = sum(adverse_outcome, na.rm = TRUE),
+    adverse_outcome_rate = mean(adverse_outcome, na.rm = TRUE)
+  ) %>%
+  arrange(desc(adverse_outcome_rate))
+
+print(race_summary)
+
+#create a table
+library(gt)
+
+race_table <- gt(race_summary) %>%
+  tab_header(
+    title = "Adverse Outcomes by Subject Race",
+    subtitle = "Proportion of Stops Resulting in Adverse Outcomes"
+  ) %>%
+  cols_label(
+    subject_race = "Race",
+    total_stops = "Total Stops",
+    adverse_outcome_count = "Adverse Outcomes",
+    adverse_outcome_rate = "Proportion Adverse"
+  ) %>%
+  fmt_number(
+    columns = vars(adverse_outcome_rate),
+    decimals = 2
+  )
+
+gtsave(race_table, "race_table.html")
+browseURL("race_table.html")
+print(race_table)
+
+#create a bar plot
+library(ggplot2)
+
+ggplot(race_summary, aes(x = reorder(subject_race, -adverse_outcome_rate), y = adverse_outcome_rate, fill = subject_race)) +
+  geom_bar(stat = "identity") +
+  labs(
+    title = "Adverse Outcomes by Subject Race",
+    x = "Race",
+    y = "Proportion of Adverse Outcomes"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
